@@ -1,8 +1,9 @@
 [project]
 name = "ironcalc"
-version = "0.9.1"
+version = "0.9.1+agnes.1"
 description = "Create, edit and evaluate Excel spreadsheets"
 requires-python = ">=3.10"
+license-files = ["LICENSE-MIT.md", "LICENSE-Apache-2.0.md", "NOTICE-AGNES.md"]
 keywords = [
   "xlsx",
   "spreadsheet",

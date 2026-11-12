@@ -1,0 +1,237 @@
+name: Agnes release
+
+on:
+  push:
+    tags: ["v*-agnes.*"]
+    branches: ["agnes/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.98.1"
+  MATURIN_VERSION: "1.15.0"
+  WASM_PACK_VERSION: "0.15.0"
+  PNPM_VERSION: "9.15.4"
+  PY_VERSION: "0.9.1+agnes.1"
+  NPM_VERSION: "0.9.1-agnes.1"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo test ironcalc_base
+        run: |
+          set -o pipefail
+          cargo test -p ironcalc_base --release --locked 2>&1 | tee test.log
+      - name: Check the full-range bound tests ran
+        run: |
+          passed=$(grep -cE '^test test::test_full_range_bounds::[a-z0-9_]+ \.\.\. ok$' test.log || true)
+          echo "test_full_range_bounds passed: $passed"
+          test "$passed" -ge 15
+          ! grep -E '^test .* \.\.\. FAILED$' test.log
+
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64
+            manylinux: auto
+          - os: macos-14
+            target: aarch64
+            manylinux: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -i python3.11 -i python3.12 -i python3.13
+          working-directory: bindings/python
+      - name: Inspect wheels
+        working-directory: bindings/python
+        run: |
+          ls -l dist
+          test "$(ls dist/*.whl | wc -l)" -eq 3
+          for py in 3.11 3.12 3.13; do
+            python$py - <<'EOF'
+          import glob, sys, zipfile
+          tag = "cp%d%d" % sys.version_info[:2]
+          (whl,) = [w for w in glob.glob("dist/*.whl") if f"-{tag}-" in w]
+          assert whl.split("/")[-1].startswith("ironcalc-0.9.1+agnes.1-"), whl
+          with zipfile.ZipFile(whl) as z:
+              names = z.namelist()
+              meta = [n for n in names if n.endswith(".dist-info/METADATA")]
+              assert len(meta) == 1, meta
+              text = z.read(meta[0]).decode()
+              assert "\nVersion: 0.9.1+agnes.1\n" in text, text[:400]
+              for lic in ["LICENSE-MIT.md", "LICENSE-Apache-2.0.md", "NOTICE-AGNES.md"]:
+                  assert any(n.endswith(".dist-info/licenses/" + lic) for n in names), (lic, names)
+          print("ok", whl)
+          EOF
+          done
+      - name: Smoke test in clean venvs
+        run: |
+          for py in 3.11 3.12 3.13; do
+            rm -rf "$RUNNER_TEMP/venv"
+            python$py -m venv "$RUNNER_TEMP/venv"
+            "$RUNNER_TEMP/venv/bin/python" -m pip install --no-index --find-links bindings/python/dist "ironcalc==$PY_VERSION"
+            (cd "$RUNNER_TEMP" && "$RUNNER_TEMP/venv/bin/python" -I - <<'EOF'
+          import importlib.metadata, sys
+          import ironcalc as ic
+          v = importlib.metadata.version("ironcalc")
+          assert v == "0.9.1+agnes.1", v
+          assert ic.__version__ == "0.9.1+agnes.1", ic.__version__
+          m = ic.create("smoke")
+          for row, value in enumerate(["5", "7", "9"], start=1):
+              m.set_user_input(0, row, 1, value)
+          m.set_user_input(0, 1, 2, "=MATCH(7,A:A,0)")
+          m.set_user_input(0, 2, 2, "=MAX(A:A)")
+          m.set_user_input(0, 3, 2, "=VLOOKUP(9,A:A,1,FALSE)")
+          m.evaluate()
+          got = [m.get_formatted_cell_value(0, r, 2) for r in (1, 2, 3)]
+          assert got == ["2", "9", "9"], got
+          print("ok", sys.version.split()[0], v)
+          EOF
+            )
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install wasm build tooling
+        run: npm install -g "wasm-pack@$WASM_PACK_VERSION" "pnpm@$PNPM_VERSION"
+      - name: make tests
+        working-directory: bindings/wasm
+        run: make tests
+      - name: make
+        working-directory: bindings/wasm
+        run: make
+      - name: Set version and add NOTICE-AGNES.md
+        working-directory: bindings/wasm/pkg
+        run: |
+          cp ../../../NOTICE-AGNES.md .
+          node -e '
+          const fs = require("fs");
+          const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          p.version = process.env.NPM_VERSION;
+          if (!p.files.includes("NOTICE-AGNES.md")) p.files.push("NOTICE-AGNES.md");
+          fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          cat package.json
+      - name: npm pack
+        run: |
+          mkdir -p out
+          (cd bindings/wasm/pkg && npm pack --pack-destination ../../../out)
+          ls -l out
+          test -f "out/ironcalc-wasm-$NPM_VERSION.tgz"
+      - name: Verify tarball
+        run: |
+          set -e
+          tgz="out/ironcalc-wasm-$NPM_VERSION.tgz"
+          tar -tzf "$tgz" | sort | tee files.txt
+          for f in wasm.js wasm_bg.wasm wasm.d.ts package.json LICENSE-MIT LICENSE-Apache-2.0 THIRD-PARTY-NOTICES.md NOTICE-AGNES.md; do
+            grep -qx "package/$f" files.txt || { echo "missing $f"; exit 1; }
+          done
+          tar -xzOf "$tgz" package/package.json | node -e '
+          const p = JSON.parse(require("fs").readFileSync(0, "utf8"));
+          if (p.name !== "@ironcalc/wasm") throw new Error("name " + p.name);
+          if (p.version !== process.env.NPM_VERSION) throw new Error("version " + p.version);
+          console.log(p.name, p.version);
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: wasm-tgz
+          path: out/*.tgz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, wheels, wasm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Check tag and assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "$TAG" = "v$NPM_VERSION"
+          ls -l assets
+          test "$(ls assets/*.whl | wc -l)" -eq 6
+          test -f "assets/ironcalc-wasm-$NPM_VERSION.tgz"
+          (cd assets && sha256sum *.whl *.tgz > SHA256SUMS && cat SHA256SUMS)
+      - name: Fail if the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            exit 1
+          fi
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<EOF
+          Agnes build of IronCalc 0.9.1 with one patch. This is not an official IronCalc release.
+
+          Packages: Python \`ironcalc\` \`$PY_VERSION\` (CPython 3.11, 3.12, 3.13; manylinux x86_64 and macOS arm64) and npm \`@ironcalc/wasm\` \`$NPM_VERSION\`. Not published to PyPI or npm.
+
+          What changed compared with IronCalc 0.9.1:
+          - Whole-column and whole-row ranges are bounded to the stored data in MATCH, LOOKUP, VLOOKUP and HLOOKUP (XLOOKUP and XMATCH unchanged).
+          - The same bound applies to blank-neutral aggregates: MIN, MAX, COUNT, COUNTA, AVERAGE and the functions sharing their value walk, MINA, MAXA, AVERAGEA, AND, OR, XOR.
+          - Worksheet::dimension is computed per row instead of per cell.
+
+          Upstream report: https://github.com/ironcalc/IronCalc/issues/1414
+
+          Built and tested by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID from commit $GITHUB_SHA. Licences: MIT OR Apache-2.0, see NOTICE-AGNES.md. Checksums in SHA256SUMS.
+          EOF
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file notes.md assets/*.whl assets/*.tgz assets/SHA256SUMS
