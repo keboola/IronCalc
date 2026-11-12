@@ -187,6 +187,19 @@ impl Row {
         }
     }
 
+    /// The first and the last column that hold a cell, if any does.
+    pub(super) fn column_span(&self) -> Option<(i32, i32)> {
+        match self {
+            Row::Cells(cells) => Some((cells.first()?.0, cells.last()?.0)),
+            Row::Numbers {
+                first_column,
+                values,
+                ..
+            } => (!values.is_empty())
+                .then(|| (*first_column, *first_column + values.len() as i32 - 1)),
+        }
+    }
+
     /// Where the column is among the numbers of a row of numbers.
     #[inline]
     pub(super) fn offset(first_column: i32, values: &[f64], column: i32) -> Option<usize> {

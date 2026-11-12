@@ -47,6 +47,11 @@ impl Chunk {
     }
 }
 
+/// A cell that is more than a style: a value, a formula or a spilled value.
+fn holds_something(cell: &Cell) -> bool {
+    !matches!(cell, Cell::EmptyCell { .. })
+}
+
 /// The chunk and the place in it of a row, if the row is within the sheet.
 #[inline]
 fn locate(row: i32) -> Option<(usize, usize)> {
@@ -90,7 +95,7 @@ impl SheetData {
     }
 
     /// Every row that exists with its number, in ascending order.
-    fn rows_in_order(&self) -> impl Iterator<Item = (i32, &Row)> {
+    fn rows_in_order(&self) -> impl DoubleEndedIterator<Item = (i32, &Row)> {
         self.chunks
             .iter()
             .enumerate()
@@ -146,6 +151,36 @@ impl SheetData {
                 .iter()
                 .map(move |(column, cell)| (row, column, cell))
         })
+    }
+
+    /// The rows and columns the cells span, as `(first_row, last_row,
+    /// first_column, last_column)`, or `None` if there are no cells. A row
+    /// is sorted by column, so it is read at its two ends, not cell by cell.
+    pub fn extent(&self) -> Option<(i32, i32, i32, i32)> {
+        self.rows_in_order()
+            .filter_map(|(row, data)| Some((row, data.column_span()?)))
+            .fold(None, |extent, (row, (first, last))| match extent {
+                None => Some((row, row, first, last)),
+                Some((top, _, left, right)) => Some((top, row, left.min(first), right.max(last))),
+            })
+    }
+
+    /// The last row whose cell in `column` holds something more than a style.
+    /// The rows are searched from the bottom up.
+    pub fn last_row_in_column(&self, column: i32) -> Option<i32> {
+        self.rows_in_order()
+            .rev()
+            .find(|(_, data)| data.get(column).is_some_and(|cell| holds_something(&cell)))
+            .map(|(row, _)| row)
+    }
+
+    /// The last column of `row` whose cell holds something more than a style.
+    pub fn last_column_in_row(&self, row: i32) -> Option<i32> {
+        self.row(row)?
+            .iter()
+            .filter(|(_, cell)| holds_something(cell))
+            .last()
+            .map(|(column, _)| column)
     }
 
     /// The rows that exist, in ascending order.

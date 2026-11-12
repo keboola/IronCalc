@@ -85,16 +85,36 @@ impl LookupTable {
 
     /// Materializes the first row of the table (the search vector for HLOOKUP).
     fn first_row(&self, model: &mut Model, cell: CellReferenceIndex) -> Vec<CalcResult> {
-        (0..self.columns())
-            .map(|column| self.get(model, 0, column, cell))
-            .collect()
+        match self {
+            LookupTable::Range { left, right } => model.prepare_lookup_vector(
+                left,
+                &CellReferenceIndex {
+                    row: left.row,
+                    ..*right
+                },
+                false,
+            ),
+            LookupTable::Array(_) => (0..self.columns())
+                .map(|column| self.get(model, 0, column, cell))
+                .collect(),
+        }
     }
 
     /// Materializes the first column of the table (the search vector for VLOOKUP).
     fn first_column(&self, model: &mut Model, cell: CellReferenceIndex) -> Vec<CalcResult> {
-        (0..self.rows())
-            .map(|row| self.get(model, row, 0, cell))
-            .collect()
+        match self {
+            LookupTable::Range { left, right } => model.prepare_lookup_vector(
+                left,
+                &CellReferenceIndex {
+                    column: left.column,
+                    ..*right
+                },
+                true,
+            ),
+            LookupTable::Array(_) => (0..self.rows())
+                .map(|row| self.get(model, row, 0, cell))
+                .collect(),
+        }
     }
 }
 
@@ -219,7 +239,7 @@ impl<'a> Model<'a> {
                         message: "Argument must be a vector".to_string(),
                     });
                 };
-                Ok(self.prepare_array(&left, &right, is_row_vector))
+                Ok(self.prepare_lookup_vector(&left, &right, is_row_vector))
             }
             CalcResult::Array(array) => {
                 // An array is a vector if it is a single row or a single column.
@@ -651,12 +671,25 @@ impl<'a> Model<'a> {
                 Some(l) => l,
                 None => return not_found,
             };
-            let result = self.evaluate_node_in_context(&args[2], cell);
-            let result_vector = match self.as_vector(result, cell) {
-                Ok(values) => values,
-                Err(error) => return error,
+            // Only that one cell of the result vector is read: read whole, a
+            // whole column on another sheet would stop at that sheet's used
+            // area, short of the position.
+            let result = match self.evaluate_node_in_context(&args[2], cell) {
+                CalcResult::Range { left, right } => LookupTable::Range { left, right },
+                CalcResult::Array(array) => LookupTable::Array(array),
+                error @ CalcResult::Error { .. } => return error,
+                _ => return not_found,
             };
-            return result_vector.into_iter().nth(l).unwrap_or(not_found);
+            let (rows, columns, l) = (result.rows(), result.columns(), l as i32);
+            return if rows == 1 && l < columns {
+                result.get(self, 0, l, cell)
+            } else if columns == 1 && l < rows {
+                result.get(self, l, 0, cell)
+            } else if rows != 1 && columns != 1 {
+                CalcResult::new_error(Error::ERROR, cell, "Argument must be a vector".to_string())
+            } else {
+                not_found
+            };
         }
 
         // Array form (also covers a plain vector, where the first and last
