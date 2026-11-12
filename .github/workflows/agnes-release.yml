@@ -32,16 +32,23 @@ jobs:
           rustc --version
       - name: cargo fmt --check
         run: cargo fmt --all --check
-      - name: cargo test ironcalc_base
+      - name: cargo test ironcalc_base (dev profile, whole crate)
         run: |
           set -o pipefail
-          cargo test -p ironcalc_base --release --locked 2>&1 | tee test.log
+          cargo test -p ironcalc_base --locked 2>&1 | tee test-dev.log
+      - name: cargo test ironcalc_base (release profile)
+        run: |
+          set -o pipefail
+          cargo test -p ironcalc_base --release --locked -- --skip test::user_model::test_to_from_bytes::errors 2>&1 | tee test.log
       - name: Check the full-range bound tests ran
         run: |
-          passed=$(grep -cE '^test test::test_full_range_bounds::[a-z0-9_]+ \.\.\. ok$' test.log || true)
-          echo "test_full_range_bounds passed: $passed"
-          test "$passed" -ge 15
-          ! grep -E '^test .* \.\.\. FAILED$' test.log
+          for log in test-dev.log test.log; do
+            passed=$(grep -cE '^test test::test_full_range_bounds::[a-z0-9_]+ \.\.\. ok$' "$log" || true)
+            echo "$log test_full_range_bounds passed: $passed"
+            test "$passed" -ge 15
+            ! grep -E '^test .* \.\.\. FAILED$' "$log"
+            grep -E '^test result: ' "$log"
+          done
 
   wheels:
     strategy:
@@ -51,7 +58,7 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64
             manylinux: auto
-          - os: macos-14
+          - os: macos-15
             target: aarch64
             manylinux: ""
     runs-on: ${{ matrix.os }}
